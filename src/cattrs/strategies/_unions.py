@@ -26,6 +26,8 @@ def configure_tagged_union(
     tag_generator: Callable[[type], str] = default_tag_generator,
     tag_name: str = "_type",
     default: Union[type, NothingType] = NOTHING,
+    *,
+    allow_subsets: bool = False,
 ) -> None:
     """
     Configure the converter so that `union` (which should be a union, or a type alias
@@ -41,6 +43,8 @@ def configure_tagged_union(
         unstructured payload. By default, `'_type'`.
     :param default: An optional class to be used if the tag information
         is not present when structuring.
+    :param allow_subsets: Whether to apply the strategy to unions containing
+        only a subset of the configured union's members.
 
     The tagged union strategy currently only works with the dict
     un/structuring base strategy.
@@ -49,6 +53,8 @@ def configure_tagged_union(
 
     ..  versionchanged:: 25.1
         Type aliases of unions are now also supported.
+    .. versionchanged:: NEXT
+        Added the `allow_subsets` parameter.
     """
     if is_type_alias(union):
         union = union.__value__
@@ -57,6 +63,7 @@ def configure_tagged_union(
     tag_to_hook = {}
     exact_cl_unstruct_hooks = {}
     cl_to_tag = {}
+    forbid_extra_keys = getattr(converter, "forbid_extra_keys", False)
 
     if default is not NOTHING:
         default_handler = converter.get_structure_hook(default)
@@ -67,7 +74,7 @@ def configure_tagged_union(
         tag_to_hook = defaultdict(lambda: structure_default)
         cl_to_tag = defaultdict(lambda: default)
 
-        if getattr(converter, "forbid_extra_keys", False):
+        if forbid_extra_keys:
 
             def structure_tagged_union(
                 val: dict,
@@ -97,7 +104,7 @@ def configure_tagged_union(
                 return _dh(val, _default)
 
     else:
-        if getattr(converter, "forbid_extra_keys", False):
+        if forbid_extra_keys:
 
             def structure_tagged_union(
                 val: dict, _, _tag_to_cl=tag_to_hook, _tag_name=tag_name
@@ -139,6 +146,82 @@ def configure_tagged_union(
         tag_to_hook[tag] = structure_union_member
         exact_cl_unstruct_hooks[cl] = unstructure_union_member
         cl_to_tag[cl] = tag
+
+    if allow_subsets:
+        configured_tags = set(cl_to_tag.values())
+        existing_unstructure_predicates = tuple(
+            predicate
+            for predicate, _, is_generator, _ in converter._unstructure_func._function_dispatch._handler_pairs
+            if not is_generator and predicate is not is_union_type
+        )
+
+        def is_tagged_union_subset(exact_type: Any) -> bool:
+            return (
+                is_union_type(exact_type)
+                and exact_type != union
+                and exact_type not in converter._union_struct_registry
+                and all(cl in cl_to_tag for cl in exact_type.__args__)
+            )
+
+        def make_structure_tagged_union_subset(exact_type: Any) -> Callable:
+            subset_tag_to_hook = {
+                cl_to_tag[cl]: tag_to_hook[cl_to_tag[cl]] for cl in exact_type.__args__
+            }
+            subset_default_handler = (
+                default_handler
+                if default is not NOTHING and default in exact_type.__args__
+                else None
+            )
+
+            def structure_tagged_union_subset(
+                val: dict,
+                _,
+                _tag_to_hook=subset_tag_to_hook,
+                _tag_name=tag_name,
+                _default_handler=subset_default_handler,
+                _default=default,
+            ) -> exact_type:
+                if _tag_name not in val:
+                    if _default_handler is not None:
+                        return _default_handler(val, _default)
+                    raise KeyError(_tag_name)
+
+                if forbid_extra_keys:
+                    val = val.copy()
+                    tag = val.pop(_tag_name)
+                else:
+                    tag = val[_tag_name]
+
+                if tag in _tag_to_hook:
+                    return _tag_to_hook[tag](val)
+                if tag in configured_tags or _default_handler is None:
+                    raise KeyError(tag)
+                return _default_handler(val, _default)
+
+            return structure_tagged_union_subset
+
+        converter.register_structure_hook_factory(
+            is_tagged_union_subset, make_structure_tagged_union_subset
+        )
+
+        def has_existing_unstructure_hook(exact_type: Any) -> bool:
+            for predicate in existing_unstructure_predicates:
+                try:
+                    if predicate(exact_type):
+                        return True
+                except Exception:  # noqa: S112
+                    continue
+            return False
+
+        converter.register_unstructure_hook_factory(
+            lambda exact_type: (
+                is_union_type(exact_type)
+                and exact_type != union
+                and all(cl in cl_to_tag for cl in exact_type.__args__)
+                and not has_existing_unstructure_hook(exact_type)
+            ),
+            lambda _: unstructure_tagged_union,
+        )
 
 
 def configure_union_passthrough(

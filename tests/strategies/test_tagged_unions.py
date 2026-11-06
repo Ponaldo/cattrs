@@ -1,5 +1,6 @@
 from typing import Optional, Sequence, Union
 
+import pytest
 from attrs import define
 
 from cattrs import BaseConverter, Converter
@@ -14,6 +15,11 @@ class A:
 @define
 class B:
     a: str
+
+
+@define
+class C:
+    a: int
 
 
 def test_defaults(converter: BaseConverter) -> None:
@@ -177,3 +183,108 @@ def test_nested_sequence_union():
 
     data = c.unstructure(Top(u=[B(a="")]), Top)
     c.structure(data, Top)
+
+
+def test_tagged_union_allow_subsets_round_trip(converter: BaseConverter) -> None:
+    """Subset unions can opt into the tagged strategy when configured to do so."""
+
+    @define
+    class WithSubset:
+        value: Union[A, B]
+
+    configure_tagged_union(Union[A, B, C], converter, allow_subsets=True)
+
+    value = WithSubset(value=B("1"))
+    data = converter.unstructure(value, WithSubset)
+
+    assert data == {"value": {"_type": "B", "a": "1"}}
+    assert converter.structure(data, WithSubset) == value
+
+
+def test_tagged_union_allow_subsets_rejects_unrelated_tag(
+    converter: BaseConverter,
+) -> None:
+    """Subset unions should reject tags from excluded members."""
+    configure_tagged_union(Union[A, B, C], converter, allow_subsets=True)
+
+    with pytest.raises(KeyError):
+        converter.structure({"_type": "C", "a": 1}, Union[A, B])
+
+
+def test_tagged_union_without_allow_subsets_keeps_legacy_behavior(
+    converter: BaseConverter,
+) -> None:
+    """The legacy subset behavior stays unchanged unless allow_subsets is enabled."""
+
+    @define
+    class WithSubset:
+        value: Union[A, B]
+
+    configure_tagged_union(Union[A, B, C], converter)
+
+    value = WithSubset(value=B("1"))
+    assert converter.unstructure(value, WithSubset) == {"value": {"a": "1"}}
+    with pytest.raises(TypeError):
+        converter.structure({"value": {"a": "1"}}, WithSubset)
+
+
+def test_tagged_union_subset_uses_included_default(converter: BaseConverter) -> None:
+    """A subset can use the configured default when it is a member."""
+    configure_tagged_union(Union[A, B, C], converter, default=A, allow_subsets=True)
+
+    assert converter.structure({"a": 1}, Union[A, B]) == A(1)
+
+
+def test_tagged_union_subset_ignores_excluded_default(converter: BaseConverter) -> None:
+    """A default outside the subset is not used when its tag is missing."""
+    configure_tagged_union(Union[A, B, C], converter, default=C, allow_subsets=True)
+
+    with pytest.raises(KeyError):
+        converter.structure({"a": 1}, Union[A, B])
+
+
+def test_tagged_union_subset_unknown_tag_uses_included_default(
+    converter: BaseConverter,
+) -> None:
+    """Unknown tags use the default, but tags for excluded classes do not."""
+    configure_tagged_union(Union[A, B, C], converter, default=A, allow_subsets=True)
+    value = {"_type": "zzz", "a": 1}
+
+    assert converter.structure(value, Union[A, B, C]) == A(1)
+    assert converter.structure(value, Union[A, B]) == A(1)
+    with pytest.raises(KeyError):
+        converter.structure({"_type": "C", "a": 1}, Union[A, B])
+
+
+def test_tagged_union_subset_forbid_extra_keys() -> None:
+    """Subset tags are removed before structuring when extra keys are forbidden."""
+    converter = Converter(forbid_extra_keys=True)
+    subset = Union[A, B]
+    configure_tagged_union(Union[A, B, C], converter, allow_subsets=True)
+
+    data = converter.unstructure(B("1"), subset)
+    assert data == {"_type": "B", "a": "1"}
+    assert converter.structure(data, subset) == B("1")
+
+
+def test_tagged_union_reordered_subset(converter: BaseConverter) -> None:
+    """Subsets use the tagged strategy regardless of member order."""
+    subset = Union[B, A]
+    configure_tagged_union(Union[A, B, C], converter, allow_subsets=True)
+
+    data = converter.unstructure(A(1), subset)
+    assert data == {"_type": "A", "a": 1}
+    assert converter.structure(data, subset) == A(1)
+
+
+def test_tagged_union_subset_preserves_registered_hooks(
+    converter: BaseConverter,
+) -> None:
+    """Previously registered hooks for a subset take precedence."""
+    subset = Union[A, B]
+    converter.register_structure_hook(subset, lambda _, __: A(2))
+    converter.register_unstructure_hook(subset, lambda _: {"custom": True})
+    configure_tagged_union(Union[A, B, C], converter, allow_subsets=True)
+
+    assert converter.structure({}, subset) == A(2)
+    assert converter.unstructure(A(1), subset) == {"custom": True}
